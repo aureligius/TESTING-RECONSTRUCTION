@@ -20,6 +20,7 @@ Usage:
 import argparse
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
 from src.data_loading import load_all_data
@@ -32,7 +33,7 @@ from baseline_argmax_test import (
 )
 
 
-def reconstruct_images_for_scan(scan_idx, s21, tumor_model):
+def reconstruct_images_for_scan(scan_idx, s21, tumor_model, id_to_original_idx):
     """Minimal version of the reconstruction pipeline — just enough to get
     the three images for plotting, reusing the same physics/beamforming
     functions used everywhere else in this project."""
@@ -47,6 +48,17 @@ def reconstruct_images_for_scan(scan_idx, s21, tumor_model):
 
     s21_idx = int(row["original_s21_idx"])
     fd_scan = s21[s21_idx]
+
+    # Empty-chamber calibration subtraction — was MISSING from this script
+    # until now (see chat discussion: this is why the center artifact looked
+    # far more dominant here than in baseline_argmax_test.py's numbers,
+    # which always had this applied). Matches baseline_argmax_test.py's
+    # reconstruct_and_score_all_variants() exactly.
+    emp_ref_id = row.get("emp_ref_id", None)
+    if emp_ref_id is not None and not pd.isna(emp_ref_id) and int(emp_ref_id) in id_to_original_idx:
+        emp_idx = id_to_original_idx[int(emp_ref_id)]
+        fd_scan = fd_scan - s21[emp_idx]
+
     time_signal = sp.to_time_domain(fd_scan)
     time_axis = sp.get_time_axis(time_signal.shape[0])
     td_mag = np.abs(time_signal)
@@ -126,6 +138,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-phantoms", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n-viz", type=int, default=10,
+                         help="Number of scans to visualize when --scan-idx isn't given "
+                              "(one per distinct phantom, seeded). Default: 10.")
     parser.add_argument("--scan-idx", type=int, default=None,
                          help="Visualize one specific scan_idx instead of the default set.")
     parser.add_argument("--out-dir", type=str, default=".")
@@ -139,6 +154,7 @@ def main():
     print("Loading data...")
     d = load_all_data()
     s21, tumor_model = d["s21"], d["tumor_model"]
+    id_to_original_idx = d["id_to_original_idx"]
 
     if args.n_phantoms > 0:
         phantom_table = build_phantom_table(tumor_model)
@@ -149,13 +165,17 @@ def main():
     if args.scan_idx is not None:
         scan_indices = [args.scan_idx]
     else:
-        # A representative spread: first 3 scans (whatever they are) plus
-        # the known extreme SCR outlier (scan_idx=143, phant_id=A11F12,
-        # from the n=214 run) if it's in range for this dataset.
-        scan_indices = [0, 1, 2]
-        if len(tumor_model) > 143:
-            scan_indices.append(143)
-        print(f"No --scan-idx given — visualizing a representative set: {scan_indices}")
+        # One scan per DISTINCT phantom (same logic as --one-per-phantom in
+        # baseline_argmax_test.py) — up to --n-viz phantoms, seeded/
+        # reproducible — instead of the old hardcoded [0,1,2,143] list.
+        rng = np.random.default_rng(args.seed)
+        scan_indices = []
+        for pid, group in tumor_model.groupby("phant_id"):
+            scan_indices.append(int(rng.choice(group.index.values)))
+        rng.shuffle(scan_indices)
+        scan_indices = sorted(scan_indices[:args.n_viz])
+        print(f"No --scan-idx given — visualizing {len(scan_indices)} scans, "
+              f"one per distinct phantom: {scan_indices}")
 
     for scan_idx in scan_indices:
         if scan_idx >= len(tumor_model):
@@ -163,7 +183,7 @@ def main():
                   f"(len={len(tumor_model)})")
             continue
         print(f"Reconstructing scan_idx={scan_idx}...")
-        result = reconstruct_images_for_scan(scan_idx, s21, tumor_model)
+        result = reconstruct_images_for_scan(scan_idx, s21, tumor_model, id_to_original_idx)
         plot_scan(scan_idx, result, out_dir=args.out_dir, display_margin=args.display_margin)
 
 
